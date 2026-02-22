@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 const CSS = `
   @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&display=swap');
@@ -353,6 +353,146 @@ const STATE_LABELS = [
   {t:"VA",x:523,y:256},{t:"PA",x:531,y:208},{t:"NY",x:546,y:173},
   {t:"ME",x:583,y:138},
 ];
+
+const NREL_API_URL = "https://developer.nrel.gov/api/alt-fuel-stations/v1.json";
+
+function projectToUsMap(lat, lon) {
+  const minLon = -125, maxLon = -66.5;
+  const minLat = 24, maxLat = 49.5;
+  const xNorm = (Math.min(maxLon, Math.max(minLon, lon)) - minLon) / (maxLon - minLon);
+  const yNorm = (maxLat - Math.min(maxLat, Math.max(minLat, lat))) / (maxLat - minLat);
+  return { x: 52 + xNorm * 568, y: 46 + yNorm * 392 };
+}
+
+function NrelLiveMap({ height = 480 }) {
+  const [stations, setStations] = useState([]);
+  const [selected, setSelected] = useState(null);
+  const [hoveredId, setHoveredId] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [lastUpdated, setLastUpdated] = useState(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    const apiKey = import.meta.env.VITE_NREL_API_KEY || "DEMO_KEY";
+
+    async function loadStations() {
+      setLoading(true);
+      setError("");
+      try {
+        const params = new URLSearchParams({
+          api_key: apiKey,
+          fuel_type: "ELEC",
+          status: "E",
+          country: "US",
+          limit: "1200",
+        });
+        const res = await fetch(`${NREL_API_URL}?${params.toString()}`);
+        if (!res.ok) throw new Error(`Request failed (${res.status})`);
+
+        const data = await res.json();
+        const rows = Array.isArray(data?.fuel_stations) ? data.fuel_stations : [];
+        const mapped = rows
+          .map((s) => {
+            const lat = Number(s?.latitude);
+            const lon = Number(s?.longitude);
+            if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+            return {
+              id: s.id,
+              name: s.station_name || `Station ${s.id}`,
+              city: s.city || "",
+              state: s.state || "",
+              network: s.ev_network || "Unknown",
+              access: s.access_days_time || "Access info unavailable",
+              level2: Number(s.ev_level2_evse_num || 0),
+              dcFast: Number(s.ev_dc_fast_num || 0),
+              ...projectToUsMap(lat, lon),
+            };
+          })
+          .filter(Boolean);
+
+        if (!cancelled) {
+          setStations(mapped);
+          setLastUpdated(new Date());
+        }
+      } catch (e) {
+        if (!cancelled) {
+          setError(e?.message || "Unable to load station data.");
+          setStations([]);
+        }
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    }
+
+    loadStations();
+    return () => { cancelled = true; };
+  }, []);
+
+  return (
+    <div
+      style={{ position:"relative", height, background:"#1a2535", overflow:"hidden", fontFamily:"var(--font)" }}
+      onClick={() => setSelected(null)}
+    >
+      <svg viewBox="0 0 720 460" style={{ width:"100%", height:"100%", display:"block" }} preserveAspectRatio="xMidYMid slice">
+        <defs>
+          <pattern id="nrelgrid" width="60" height="60" patternUnits="userSpaceOnUse">
+            <path d="M60 0L0 0 0 60" fill="none" stroke="rgba(255,255,255,0.04)" strokeWidth="1"/>
+          </pattern>
+        </defs>
+        <rect width="720" height="460" fill="#1e3050"/>
+        <rect width="720" height="460" fill="url(#nrelgrid)"/>
+        <rect x="52" y="46" width="568" height="392" rx="10" fill="#263549"/>
+        <rect x="8" y="352" width="118" height="88" rx="8" fill="#263549"/>
+        <ellipse cx="172" cy="432" rx="32" ry="13" fill="#263549"/>
+
+        {STATE_LABELS.map(({t,x,y}) => (
+          <text key={t} x={x} y={y} textAnchor="middle" dominantBaseline="middle" fontSize="8" fontWeight="600" fill="rgba(255,255,255,0.20)" fontFamily="Space Grotesk, sans-serif">{t}</text>
+        ))}
+
+        {stations.map((s) => {
+          const active = selected?.id === s.id || hoveredId === s.id;
+          return (
+            <circle
+              key={s.id}
+              cx={s.x}
+              cy={s.y}
+              r={active ? 4 : 2.3}
+              fill="rgba(242,100,25,0.88)"
+              stroke="rgba(255,255,255,0.45)"
+              strokeWidth={active ? 1.3 : 0.5}
+              style={{ cursor:"pointer" }}
+              onClick={e => { e.stopPropagation(); setSelected(s); }}
+              onMouseEnter={() => setHoveredId(s.id)}
+              onMouseLeave={() => setHoveredId(null)}
+            />
+          );
+        })}
+      </svg>
+
+      {loading && <div style={{position:"absolute",inset:0,display:"flex",alignItems:"center",justifyContent:"center",color:"#fff",fontSize:13,background:"rgba(0,0,0,0.25)"}}>Loading NREL EV stations...</div>}
+      {!loading && error && <div style={{position:"absolute",left:14,top:14,right:14,padding:"10px 12px",borderRadius:8,fontSize:12,color:"#fecaca",background:"rgba(239,68,68,0.14)",border:"1px solid rgba(239,68,68,0.35)"}}>NREL API error: {error}</div>}
+
+      {selected && (
+        <div
+          onClick={e => e.stopPropagation()}
+          style={{position:"absolute",left:`${(selected.x / 720) * 100}%`,top:`${(selected.y / 460) * 100}%`,transform:"translate(-50%,-112%)",background:"#fff",borderRadius:8,padding:"12px 14px",minWidth:220,boxShadow:"0 8px 28px rgba(0,0,0,0.22)",border:"1px solid rgba(0,0,0,0.09)",zIndex:20,animation:"popIn 0.15s ease"}}
+        >
+          <div style={{fontSize:10,fontWeight:700,letterSpacing:"1.5px",textTransform:"uppercase",color:"#8a8a8a",marginBottom:4}}>NREL Station #{selected.id}</div>
+          <div style={{fontSize:13,fontWeight:700,color:"#111",marginBottom:4}}>{selected.name}</div>
+          <div style={{fontSize:12,color:"#5a5a5a"}}>{selected.city}{selected.city && selected.state ? ", " : ""}{selected.state}</div>
+          <div style={{fontSize:12,color:"#8a8a8a",marginTop:4}}>Network: <strong style={{color:"#111"}}>{selected.network}</strong></div>
+          <div style={{fontSize:12,color:"#8a8a8a",marginTop:2}}>Level 2: <strong style={{color:"#111"}}>{selected.level2}</strong> · DC Fast: <strong style={{color:"#111"}}>{selected.dcFast}</strong></div>
+          <div style={{fontSize:11,color:"#8a8a8a",marginTop:6,lineHeight:1.35}}>{selected.access}</div>
+        </div>
+      )}
+
+      <div style={{ position:"absolute", bottom:6, left:10, fontSize:9, color:"rgba(255,255,255,0.25)", letterSpacing:"0.5px" }}>
+        NREL AFDC Live Data · {stations.length.toLocaleString()} stations{lastUpdated ? ` · ${lastUpdated.toLocaleTimeString()}` : ""}
+      </div>
+    </div>
+  );
+}
 
 function SampleMap({ height = 340, compact = false }) {
   const [selected, setSelected] = useState(null);
@@ -784,15 +924,13 @@ function HomePage({ setModal, locations, aboutText }) {
       <div id="mapSection">
         <div style={{padding:"48px 48px 24px",background:"var(--white)"}}>
           <div className="section-tag">Live Network Map</div>
-          <h2 className="section-title">Active Stations & Fault Alerts</h2>
-          <p style={{color:"var(--mid-grey)",fontSize:14,marginBottom:0}}>Click any pin to view station details. Drag to pan. Zoom with +/− buttons.</p>
+          <h2 className="section-title">Active U.S. EV Stations</h2>
+          <p style={{color:"var(--mid-grey)",fontSize:14,marginBottom:0}}>Live station data from the NREL Alternative Fuel Stations API. Click any pin to view details.</p>
         </div>
-        <SampleMap height={480} />
+        <NrelLiveMap height={480} />
         <div className="map-legend-bar">
-          {[["#ef4444","Critical Fault"],["#f26419","Warning"],["#22c55e","Operational"]].map(([c,l])=>(
-            <div key={l} className="mli"><span className="mli-dot" style={{background:c}}/>{l}</div>
-          ))}
-          <span style={{marginLeft:"auto",fontSize:11,color:"rgba(255,255,255,0.3)"}}>Sample network data · EV-ChargeGuard</span>
+          <div className="mli"><span className="mli-dot" style={{background:"#f26419"}}/>Public EV stations</div>
+          <span style={{marginLeft:"auto",fontSize:11,color:"rgba(255,255,255,0.3)"}}>Source: NREL AFDC API</span>
         </div>
       </div>
 

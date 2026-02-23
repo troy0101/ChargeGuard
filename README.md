@@ -16,6 +16,13 @@ ChargeGuard is a React + Vite app configured for GitHub Pages.
 
 - `npm run build`
 
+## NREL API calls
+
+- `GET /api/alt-fuel-stations/v1.format?parameters`
+- `GET /api/alt-fuel-stations/v1/nearest.format?parameters`
+
+By default, requests are sent to `https://developer.nrel.gov`. Override this with `VITE_NREL_API_BASE_URL` if needed.
+
 ## GitHub Pages deployment
 
 This repo includes a GitHub Actions workflow at [\.github/workflows/deploy.yml](.github/workflows/deploy.yml) that builds and deploys on every push to `main`.

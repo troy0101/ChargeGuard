@@ -354,7 +354,87 @@ const STATE_LABELS = [
   {t:"ME",x:583,y:138},
 ];
 
-const NREL_API_URL = "https://developer.nrel.gov/api/alt-fuel-stations/v1.json";
+const NREL_API_BASE_URL = (import.meta.env.VITE_NREL_API_BASE_URL || "https://developer.nrel.gov").replace(/\/$/, "");
+const ALT_FUEL_STATIONS_PATH = "/api/alt-fuel-stations/v1";
+const ALT_FUEL_STATIONS_NEAREST_PATH = "/api/alt-fuel-stations/v1/nearest";
+
+function buildAltFuelStationsUrl(path, params, format = "json") {
+  const query = new URLSearchParams(params);
+  return `${NREL_API_BASE_URL}${path}.${format}?${query.toString()}`;
+}
+
+async function parseApiPayload(response) {
+  const raw = await response.text().catch(() => "");
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return { message: raw };
+  }
+}
+
+function getApiErrorMessage(payload, status) {
+  if (status === 429) return "Rate limit reached";
+  if (status === 422) return "Invalid request parameters";
+  return payload?.error?.message || payload?.errors?.[0] || payload?.message || "Request failed";
+}
+
+async function getAltFuelStations(params, format = "json") {
+  const response = await fetch(buildAltFuelStationsUrl(ALT_FUEL_STATIONS_PATH, params, format));
+  const payload = await parseApiPayload(response);
+  if (!response.ok) {
+    const apiMessage = getApiErrorMessage(payload, response.status);
+    const err = new Error(`${apiMessage} (${response.status})`);
+    err.status = response.status;
+    throw err;
+  }
+  return payload;
+}
+
+async function getNearestAltFuelStations(params, format = "json") {
+  const response = await fetch(buildAltFuelStationsUrl(ALT_FUEL_STATIONS_NEAREST_PATH, params, format));
+  const payload = await parseApiPayload(response);
+  if (!response.ok) {
+    const apiMessage = getApiErrorMessage(payload, response.status);
+    const err = new Error(`${apiMessage} (${response.status})`);
+    err.status = response.status;
+    throw err;
+  }
+  return payload;
+}
+
+function mapApiStationToPin(station) {
+  const lat = Number(station?.latitude);
+  const lon = Number(station?.longitude);
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+  return {
+    id: station.id,
+    name: station.station_name || `Station ${station.id}`,
+    city: station.city || "",
+    state: station.state || "",
+    network: station.ev_network || "Unknown",
+    access: station.access_days_time || "Access info unavailable",
+    level2: Number(station.ev_level2_evse_num || 0),
+    dcFast: Number(station.ev_dc_fast_num || 0),
+    ...projectToUsMap(lat, lon),
+  };
+}
+
+function buildFallbackPins() {
+  return STATIONS.map((station, index) => ({
+    id: station.id,
+    name: station.name,
+    city: station.city,
+    state: "",
+    network: "ChargeGuard Demo",
+    access: "24 hours daily",
+    level2: station.severity === "ok" ? 4 : 2,
+    dcFast: station.severity === "critical" ? 1 : 0,
+    x: station.x,
+    y: station.y,
+    order: index,
+  }));
+}
 
 function projectToUsMap(lat, lon) {
   const minLon = -125, maxLon = -66.5;
@@ -374,42 +454,35 @@ function NrelLiveMap({ height = 480 }) {
 
   useEffect(() => {
     let cancelled = false;
-    const apiKey = import.meta.env.VITE_NREL_API_KEY || "DEMO_KEY";
+    const apiKey = import.meta.env.VITE_MAP_VIEWS_API_KEY || import.meta.env.VITE_NREL_API_KEY || "DEMO_KEY";
+
+    async function getLiveStations() {
+      const requestSets = [
+        { api_key: apiKey, fuel_type: "ELEC", limit: "200" },
+        { api_key: apiKey, fuel_type: "ELEC" },
+        { api_key: apiKey, limit: "200" },
+      ];
+
+      let lastErr = null;
+      for (const requestParams of requestSets) {
+        try {
+          const data = await getAltFuelStations(requestParams, "json");
+          return Array.isArray(data?.fuel_stations) ? data.fuel_stations : [];
+        } catch (err) {
+          lastErr = err;
+          if (err?.status !== 422) throw err;
+        }
+      }
+
+      throw lastErr || new Error("Unable to load station data.");
+    }
 
     async function loadStations() {
       setLoading(true);
       setError("");
       try {
-        const params = new URLSearchParams({
-          api_key: apiKey,
-          fuel_type: "ELEC",
-          status: "E",
-          country: "US",
-          limit: "1200",
-        });
-        const res = await fetch(`${NREL_API_URL}?${params.toString()}`);
-        if (!res.ok) throw new Error(`Request failed (${res.status})`);
-
-        const data = await res.json();
-        const rows = Array.isArray(data?.fuel_stations) ? data.fuel_stations : [];
-        const mapped = rows
-          .map((s) => {
-            const lat = Number(s?.latitude);
-            const lon = Number(s?.longitude);
-            if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
-            return {
-              id: s.id,
-              name: s.station_name || `Station ${s.id}`,
-              city: s.city || "",
-              state: s.state || "",
-              network: s.ev_network || "Unknown",
-              access: s.access_days_time || "Access info unavailable",
-              level2: Number(s.ev_level2_evse_num || 0),
-              dcFast: Number(s.ev_dc_fast_num || 0),
-              ...projectToUsMap(lat, lon),
-            };
-          })
-          .filter(Boolean);
+        const rows = await getLiveStations();
+        const mapped = rows.map(mapApiStationToPin).filter(Boolean);
 
         if (!cancelled) {
           setStations(mapped);
@@ -417,8 +490,17 @@ function NrelLiveMap({ height = 480 }) {
         }
       } catch (e) {
         if (!cancelled) {
-          setError(e?.message || "Unable to load station data.");
-          setStations([]);
+          const isRateLimit = e?.status === 429 || String(e?.message || "").toLowerCase().includes("rate limit");
+          const isInvalidParams = e?.status === 422 || String(e?.message || "").toLowerCase().includes("invalid request");
+          setError(
+            isRateLimit
+              ? "NREL rate limit reached. Showing sample station data."
+              : isInvalidParams
+                ? "NREL rejected live query parameters. Showing sample station data."
+              : `Live API unavailable (${e?.message || "unknown error"}). Showing sample data.`
+          );
+          setStations(buildFallbackPins());
+          setLastUpdated(new Date());
         }
       } finally {
         if (!cancelled) setLoading(false);
@@ -471,7 +553,7 @@ function NrelLiveMap({ height = 480 }) {
       </svg>
 
       {loading && <div style={{position:"absolute",inset:0,display:"flex",alignItems:"center",justifyContent:"center",color:"#fff",fontSize:13,background:"rgba(0,0,0,0.25)"}}>Loading NREL EV stations...</div>}
-      {!loading && error && <div style={{position:"absolute",left:14,top:14,right:14,padding:"10px 12px",borderRadius:8,fontSize:12,color:"#fecaca",background:"rgba(239,68,68,0.14)",border:"1px solid rgba(239,68,68,0.35)"}}>NREL API error: {error}</div>}
+      {!loading && error && <div style={{position:"absolute",left:14,top:14,right:14,padding:"10px 12px",borderRadius:8,fontSize:12,color:"#fde68a",background:"rgba(245,158,11,0.14)",border:"1px solid rgba(245,158,11,0.35)"}}>NREL API notice: {error}</div>}
 
       {selected && (
         <div

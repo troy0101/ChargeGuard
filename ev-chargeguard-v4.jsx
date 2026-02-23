@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 const CSS = `
   @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&display=swap');
@@ -362,6 +362,7 @@ const NREL_RATE_LIMIT_COOLDOWN_MS = 10 * 60 * 1000;
 const NREL_CACHE_KEY_PREFIX = "nrel-nearest-cache:";
 const NREL_RATE_LIMIT_KEY = "nrel-rate-limit-until";
 const ZIP_COORDS_CACHE_KEY_PREFIX = "zip-coords-cache:";
+const GOOGLE_MAPS_SCRIPT_ID = "google-maps-js";
 
 function buildAltFuelStationsUrl(path, params, format = "json") {
   const query = new URLSearchParams(params);
@@ -432,6 +433,59 @@ function normalizeZip(zipCode) {
   return zipCode.trim().slice(0, 5);
 }
 
+function loadGoogleMapsApi(apiKey) {
+  return new Promise((resolve, reject) => {
+    if (window.google?.maps) {
+      resolve(window.google.maps);
+      return;
+    }
+    if (!apiKey) {
+      reject(new Error("Missing Google Maps API key"));
+      return;
+    }
+
+    const existing = document.getElementById(GOOGLE_MAPS_SCRIPT_ID);
+    if (existing) {
+      existing.addEventListener("load", () => resolve(window.google?.maps));
+      existing.addEventListener("error", () => reject(new Error("Failed to load Google Maps.")));
+      return;
+    }
+
+    let settled = false;
+    const done = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      fn(value);
+    };
+
+    const timeoutId = window.setTimeout(() => {
+      done(reject, new Error("Google Maps load timed out."));
+    }, 12000);
+
+    const previousAuthFailure = window.gm_authFailure;
+    window.gm_authFailure = () => {
+      window.clearTimeout(timeoutId);
+      done(reject, new Error("Google Maps authentication failed. Check key restrictions and billing."));
+      if (typeof previousAuthFailure === "function") previousAuthFailure();
+    };
+
+    const script = document.createElement("script");
+    script.id = GOOGLE_MAPS_SCRIPT_ID;
+    script.src = `https://maps.googleapis.com/maps/api/js?key=${apiKey}&v=weekly`;
+    script.async = true;
+    script.defer = true;
+    script.onload = () => {
+      window.clearTimeout(timeoutId);
+      done(resolve, window.google?.maps);
+    };
+    script.onerror = () => {
+      window.clearTimeout(timeoutId);
+      done(reject, new Error("Failed to load Google Maps."));
+    };
+    document.head.appendChild(script);
+  });
+}
+
 async function resolveZipToCoordinates(zipCode) {
   const normalizedZip = normalizeZip(zipCode);
   const cached = safeReadJsonFromStorage(`${ZIP_COORDS_CACHE_KEY_PREFIX}${normalizedZip}`);
@@ -491,8 +545,10 @@ function mapApiStationToPin(station) {
   const lat = Number(station?.latitude);
   const lon = Number(station?.longitude);
   if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+  const chargerIdentifier = String(station?.id ?? station?.station_id ?? `${lat},${lon}`);
   return {
     id: station.id,
+    chargerIdentifier,
     name: station.station_name || `Station ${station.id}`,
     city: station.city || "",
     state: station.state || "",
@@ -503,7 +559,8 @@ function mapApiStationToPin(station) {
     level2: Number(station.ev_level2_evse_num || 0),
     dcFast: Number(station.ev_dc_fast_num || 0),
     distance: Number.isFinite(Number(station.distance)) ? Number(station.distance) : null,
-    ...projectToUsMap(lat, lon),
+    latitude: lat,
+    longitude: lon,
   };
 }
 
@@ -533,13 +590,65 @@ function projectToUsMap(lat, lon) {
 
 function NrelLiveMap({ height = 480 }) {
   const [stations, setStations] = useState([]);
-  const [selected, setSelected] = useState(null);
-  const [hoveredId, setHoveredId] = useState(null);
+  const [selectedChargerId, setSelectedChargerId] = useState("");
+  const [chargerSearch, setChargerSearch] = useState("");
   const [zipInput, setZipInput] = useState("");
   const [activeZip, setActiveZip] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const [mapError, setMapError] = useState("");
+  const [mapsReady, setMapsReady] = useState(false);
+  const [mapCenter, setMapCenter] = useState({ lat: 39.5, lng: -98.35 });
   const [lastUpdated, setLastUpdated] = useState(null);
+  const mapRef = useRef(null);
+  const mapElRef = useRef(null);
+  const markersRef = useRef({});
+  const infoWindowRef = useRef(null);
+
+  const selected = stations.find((station) => station.chargerIdentifier === selectedChargerId) || null;
+  const normalizedSearch = chargerSearch.trim().toLowerCase();
+  const visibleStations = normalizedSearch
+    ? stations.filter((station) => (
+      station.chargerIdentifier.toLowerCase().includes(normalizedSearch)
+      || station.name.toLowerCase().includes(normalizedSearch)
+      || station.city.toLowerCase().includes(normalizedSearch)
+    ))
+    : stations;
+
+  const googleMapsApiKey = import.meta.env.VITE_GOOGLE_MAPS_API_KEY || "";
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function initMaps() {
+      if (!googleMapsApiKey) {
+        setMapError("Set VITE_GOOGLE_MAPS_API_KEY to enable Google Maps.");
+        return;
+      }
+
+      try {
+        await loadGoogleMapsApi(googleMapsApiKey);
+        if (cancelled) return;
+        setMapsReady(true);
+
+        if (!mapRef.current && mapElRef.current) {
+          mapRef.current = new window.google.maps.Map(mapElRef.current, {
+            center: { lat: 39.5, lng: -98.35 },
+            zoom: 4,
+            mapTypeControl: false,
+            streetViewControl: false,
+            fullscreenControl: false,
+          });
+          infoWindowRef.current = new window.google.maps.InfoWindow();
+        }
+      } catch (e) {
+        if (!cancelled) setMapError(e?.message || "Unable to initialize Google Maps.");
+      }
+    }
+
+    initMaps();
+    return () => { cancelled = true; };
+  }, [googleMapsApiKey]);
 
   useEffect(() => {
     let cancelled = false;
@@ -547,11 +656,12 @@ function NrelLiveMap({ height = 480 }) {
 
     async function getNearestStationsByZip(zipCode) {
       const cachedRows = readNearestCache(zipCode);
+      const coords = await resolveZipToCoordinates(zipCode);
       if (cachedRows) {
-        return { rows: cachedRows, fromCache: true };
+        return { rows: cachedRows, fromCache: true, center: coords };
       }
 
-      const { latitude, longitude } = await resolveZipToCoordinates(zipCode);
+      const { latitude, longitude } = coords;
 
       const cooldownMs = getRateLimitCooldownRemainingMs();
       if (cooldownMs > 0) {
@@ -573,7 +683,7 @@ function NrelLiveMap({ height = 480 }) {
           const rows = Array.isArray(data?.fuel_stations) ? data.fuel_stations : [];
           writeNearestCache(zipCode, rows);
           clearRateLimitCooldown();
-          return { rows, fromCache: false };
+          return { rows, fromCache: false, center: coords };
         } catch (err) {
           lastErr = err;
           if (err?.status === 429) {
@@ -591,7 +701,7 @@ function NrelLiveMap({ height = 480 }) {
       if (!activeZip) {
         if (!cancelled) {
           setStations([]);
-          setSelected(null);
+          setSelectedChargerId("");
           setLoading(false);
           setLastUpdated(null);
         }
@@ -601,11 +711,12 @@ function NrelLiveMap({ height = 480 }) {
       setLoading(true);
       setError("");
       try {
-        const { rows, fromCache } = await getNearestStationsByZip(activeZip);
+        const { rows, fromCache, center } = await getNearestStationsByZip(activeZip);
         const mapped = rows.map(mapApiStationToPin).filter(Boolean);
 
         if (!cancelled) {
-          setSelected(mapped[0] || null);
+          setMapCenter({ lat: Number(center.latitude), lng: Number(center.longitude) });
+          setSelectedChargerId(mapped[0]?.chargerIdentifier || "");
           setStations(mapped);
           if (fromCache) {
             setError(`Showing cached nearby chargers for ZIP ${activeZip}.`);
@@ -626,7 +737,7 @@ function NrelLiveMap({ height = 480 }) {
                 ? `NREL could not process ZIP ${activeZip}.`
               : `Live API unavailable (${e?.message || "unknown error"}).`
           );
-          setSelected(null);
+          setSelectedChargerId("");
           setStations([]);
           setLastUpdated(null);
         }
@@ -638,6 +749,60 @@ function NrelLiveMap({ height = 480 }) {
     loadStations();
     return () => { cancelled = true; };
   }, [activeZip]);
+
+  useEffect(() => {
+    if (!mapsReady || !mapRef.current || !window.google?.maps) return;
+
+    for (const marker of Object.values(markersRef.current)) {
+      marker.setMap(null);
+    }
+    markersRef.current = {};
+
+    if (!stations.length) {
+      mapRef.current.setCenter(mapCenter);
+      mapRef.current.setZoom(11);
+      return;
+    }
+
+    const bounds = new window.google.maps.LatLngBounds();
+
+    for (const station of stations) {
+      const marker = new window.google.maps.Marker({
+        map: mapRef.current,
+        position: { lat: station.latitude, lng: station.longitude },
+        title: `${station.name} (${station.chargerIdentifier})`,
+      });
+
+      marker.addListener("click", () => setSelectedChargerId(station.chargerIdentifier));
+      markersRef.current[station.chargerIdentifier] = marker;
+      bounds.extend({ lat: station.latitude, lng: station.longitude });
+    }
+
+    mapRef.current.fitBounds(bounds);
+  }, [mapsReady, stations, mapCenter]);
+
+  useEffect(() => {
+    if (!mapsReady || !mapRef.current || !window.google?.maps || !infoWindowRef.current) return;
+    if (!selected) {
+      infoWindowRef.current.close();
+      return;
+    }
+
+    const html = `
+      <div style="min-width:220px;font-family:Arial,sans-serif;">
+        <div style="font-size:11px;font-weight:700;letter-spacing:1px;color:#7c7c7c;text-transform:uppercase;">Charger ID ${selected.chargerIdentifier}</div>
+        <div style="font-size:14px;font-weight:700;color:#111;margin:4px 0;">${selected.name}</div>
+        <div style="font-size:12px;color:#555;">${selected.city}${selected.city && selected.state ? ", " : ""}${selected.state}</div>
+        <div style="font-size:12px;color:#555;margin-top:4px;">Network: <strong style="color:#111;">${selected.network}</strong></div>
+      </div>
+    `;
+
+    infoWindowRef.current.setContent(html);
+    infoWindowRef.current.setPosition({ lat: selected.latitude, lng: selected.longitude });
+    infoWindowRef.current.open({ map: mapRef.current });
+    mapRef.current.panTo({ lat: selected.latitude, lng: selected.longitude });
+    setMapCenter({ lat: selected.latitude, lng: selected.longitude });
+  }, [mapsReady, selected]);
 
   function handleZipSubmit(event) {
     event?.preventDefault?.();
@@ -654,7 +819,7 @@ function NrelLiveMap({ height = 480 }) {
   return (
     <div
       style={{ position:"relative", height, background:"#1a2535", overflow:"hidden", fontFamily:"var(--font)" }}
-      onClick={() => setSelected(null)}
+      onClick={() => setSelectedChargerId("")}
     >
       <form
         onSubmit={handleZipSubmit}
@@ -710,7 +875,7 @@ function NrelLiveMap({ height = 480 }) {
         </button>
         <button
           type="button"
-          onClick={() => { setZipInput(""); setActiveZip(""); setStations([]); setSelected(null); setError(""); }}
+          onClick={() => { setZipInput(""); setActiveZip(""); setStations([]); setSelectedChargerId(""); setError(""); setChargerSearch(""); }}
           style={{
             height:34,
             borderRadius:6,
@@ -728,55 +893,38 @@ function NrelLiveMap({ height = 480 }) {
         </button>
       </form>
 
-      <svg viewBox="0 0 720 460" style={{ width:"100%", height:"100%", display:"block" }} preserveAspectRatio="xMidYMid slice">
-        <defs>
-          <pattern id="nrelgrid" width="60" height="60" patternUnits="userSpaceOnUse">
-            <path d="M60 0L0 0 0 60" fill="none" stroke="rgba(255,255,255,0.04)" strokeWidth="1"/>
-          </pattern>
-        </defs>
-        <rect width="720" height="460" fill="#1e3050"/>
-        <rect width="720" height="460" fill="url(#nrelgrid)"/>
-        <rect x="52" y="46" width="568" height="392" rx="10" fill="#263549"/>
-        <rect x="8" y="352" width="118" height="88" rx="8" fill="#263549"/>
-        <ellipse cx="172" cy="432" rx="32" ry="13" fill="#263549"/>
-
-        {STATE_LABELS.map(({t,x,y}) => (
-          <text key={t} x={x} y={y} textAnchor="middle" dominantBaseline="middle" fontSize="8" fontWeight="600" fill="rgba(255,255,255,0.20)" fontFamily="Space Grotesk, sans-serif">{t}</text>
-        ))}
-
-        {stations.map((s) => {
-          const active = selected?.id === s.id || hoveredId === s.id;
-          return (
-            <circle
-              key={s.id}
-              cx={s.x}
-              cy={s.y}
-              r={active ? 5 : 3.2}
-              fill="rgba(242,100,25,0.88)"
-              stroke="rgba(255,255,255,0.45)"
-              strokeWidth={active ? 1.3 : 0.5}
-              style={{ cursor:"pointer" }}
-              onClick={e => { e.stopPropagation(); setSelected(s); }}
-              onMouseEnter={() => setHoveredId(s.id)}
-              onMouseLeave={() => setHoveredId(null)}
-            />
-          );
-        })}
-      </svg>
+      {mapError ? (
+        <iframe
+          title="Google Maps Fallback"
+          src={`https://www.google.com/maps?q=${mapCenter.lat},${mapCenter.lng}&z=11&output=embed`}
+          style={{ width:"100%", height:"100%", border:0, background:"#1e3050" }}
+          loading="lazy"
+          referrerPolicy="no-referrer-when-downgrade"
+        />
+      ) : (
+        <div ref={mapElRef} style={{ width:"100%", height:"100%", background:"#1e3050" }} />
+      )}
 
       {loading && <div style={{position:"absolute",inset:0,display:"flex",alignItems:"center",justifyContent:"center",color:"#fff",fontSize:13,background:"rgba(0,0,0,0.25)"}}>Loading nearby EV chargers for ZIP {activeZip}...</div>}
       {!loading && error && <div style={{position:"absolute",left:14,top:62,right:14,padding:"10px 12px",borderRadius:8,fontSize:12,color:"#fde68a",background:"rgba(245,158,11,0.14)",border:"1px solid rgba(245,158,11,0.35)"}}>NREL API notice: {error}</div>}
+      {!loading && mapError && <div style={{position:"absolute",left:14,top:62,right:14,padding:"10px 12px",borderRadius:8,fontSize:12,color:"#fecaca",background:"rgba(239,68,68,0.14)",border:"1px solid rgba(239,68,68,0.35)"}}>Google Maps error: {mapError} Showing embedded fallback map.</div>}
       {!loading && !error && !activeZip && <div style={{position:"absolute",left:14,top:62,right:14,padding:"10px 12px",borderRadius:8,fontSize:12,color:"#d1d5db",background:"rgba(255,255,255,0.08)",border:"1px solid rgba(255,255,255,0.18)"}}>Enter a ZIP code and click Find Nearby to load EV chargers.</div>}
 
       {activeZip && stations.length > 0 && (
         <div style={{position:"absolute",right:14,top:62,width:300,maxHeight:270,overflowY:"auto",borderRadius:10,padding:10,background:"rgba(0,0,0,0.38)",border:"1px solid rgba(255,255,255,0.14)",zIndex:22}}>
           <div style={{fontSize:11,fontWeight:700,letterSpacing:"1.2px",textTransform:"uppercase",color:"#cbd5e1",marginBottom:8}}>Nearby Chargers · ZIP {activeZip}</div>
-          {stations.slice(0, 8).map((station) => {
-            const active = selected?.id === station.id;
+          <input
+            value={chargerSearch}
+            onChange={(e) => setChargerSearch(e.target.value)}
+            placeholder="Find by Charger ID or name"
+            style={{width:"100%",height:32,borderRadius:6,border:"1px solid rgba(255,255,255,0.2)",background:"rgba(255,255,255,0.10)",color:"#fff",padding:"0 10px",fontSize:12,marginBottom:8,fontFamily:"var(--font)",outline:"none"}}
+          />
+          {visibleStations.slice(0, 8).map((station) => {
+            const active = selected?.chargerIdentifier === station.chargerIdentifier;
             return (
               <button
-                key={station.id}
-                onClick={(e) => { e.stopPropagation(); setSelected(station); }}
+                key={station.chargerIdentifier}
+                onClick={(e) => { e.stopPropagation(); setSelectedChargerId(station.chargerIdentifier); }}
                 style={{
                   width:"100%",
                   textAlign:"left",
@@ -790,28 +938,13 @@ function NrelLiveMap({ height = 480 }) {
                   fontFamily:"var(--font)"
                 }}
               >
+                <div style={{fontSize:10,fontWeight:700,color:"rgba(255,255,255,0.62)",letterSpacing:"0.8px",textTransform:"uppercase",marginBottom:2}}>ID {station.chargerIdentifier}</div>
                 <div style={{fontSize:12,fontWeight:700,lineHeight:1.3,marginBottom:2}}>{station.name}</div>
                 <div style={{fontSize:11,color:"rgba(255,255,255,0.75)"}}>{station.city}{station.state ? `, ${station.state}` : ""}</div>
                 {station.distance !== null && <div style={{fontSize:10,color:"rgba(255,255,255,0.62)",marginTop:2}}>{station.distance.toFixed(1)} mi away</div>}
               </button>
             );
           })}
-        </div>
-      )}
-
-      {selected && (
-        <div
-          onClick={e => e.stopPropagation()}
-          style={{position:"absolute",left:`${(selected.x / 720) * 100}%`,top:`${(selected.y / 460) * 100}%`,transform:"translate(-50%,-112%)",background:"#fff",borderRadius:8,padding:"12px 14px",minWidth:220,boxShadow:"0 8px 28px rgba(0,0,0,0.22)",border:"1px solid rgba(0,0,0,0.09)",zIndex:20,animation:"popIn 0.15s ease"}}
-        >
-          <div style={{fontSize:10,fontWeight:700,letterSpacing:"1.5px",textTransform:"uppercase",color:"#8a8a8a",marginBottom:4}}>NREL Station #{selected.id}</div>
-          <div style={{fontSize:13,fontWeight:700,color:"#111",marginBottom:4}}>{selected.name}</div>
-          <div style={{fontSize:12,color:"#5a5a5a"}}>{selected.city}{selected.city && selected.state ? ", " : ""}{selected.state}</div>
-          {(selected.street || selected.zip) && <div style={{fontSize:11,color:"#8a8a8a",marginTop:4}}>{selected.street}{selected.street && selected.zip ? ", " : ""}{selected.zip}</div>}
-          <div style={{fontSize:12,color:"#8a8a8a",marginTop:4}}>Network: <strong style={{color:"#111"}}>{selected.network}</strong></div>
-          <div style={{fontSize:12,color:"#8a8a8a",marginTop:2}}>Level 2: <strong style={{color:"#111"}}>{selected.level2}</strong> · DC Fast: <strong style={{color:"#111"}}>{selected.dcFast}</strong></div>
-          {selected.distance !== null && <div style={{fontSize:11,color:"#8a8a8a",marginTop:2}}>Distance: <strong style={{color:"#111"}}>{selected.distance.toFixed(1)} mi</strong></div>}
-          <div style={{fontSize:11,color:"#8a8a8a",marginTop:6,lineHeight:1.35}}>{selected.access}</div>
         </div>
       )}
 

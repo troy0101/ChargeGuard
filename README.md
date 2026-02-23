@@ -8,6 +8,7 @@ ChargeGuard is a React + Vite app configured for GitHub Pages.
    - `npm install`
 2. Configure environment:
    - Copy `.env.example` to `.env`
+   - Set `VITE_GOOGLE_MAPS_API_KEY`
    - Set `VITE_NREL_API_KEY` (you can use `DEMO_KEY` for testing)
 3. Start dev server:
    - `npm run dev`

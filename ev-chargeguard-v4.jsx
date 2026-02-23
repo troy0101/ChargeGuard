@@ -489,9 +489,9 @@ function NrelLiveMap({ height = 480 }) {
   const [stations, setStations] = useState([]);
   const [selected, setSelected] = useState(null);
   const [hoveredId, setHoveredId] = useState(null);
-  const [zipInput, setZipInput] = useState("78701");
-  const [activeZip, setActiveZip] = useState("78701");
-  const [loading, setLoading] = useState(true);
+  const [zipInput, setZipInput] = useState("");
+  const [activeZip, setActiveZip] = useState("");
+  const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [lastUpdated, setLastUpdated] = useState(null);
 
@@ -539,6 +539,16 @@ function NrelLiveMap({ height = 480 }) {
     }
 
     async function loadStations() {
+      if (!activeZip) {
+        if (!cancelled) {
+          setStations([]);
+          setSelected(null);
+          setLoading(false);
+          setLastUpdated(null);
+        }
+        return;
+      }
+
       setLoading(true);
       setError("");
       try {
@@ -562,14 +572,14 @@ function NrelLiveMap({ height = 480 }) {
           const cooldownMins = Math.max(1, Math.ceil(Number(e?.cooldownMs || 0) / 60000));
           setError(
             isRateLimit
-              ? `NREL rate limit reached. Try again in about ${cooldownMins} min. Showing sample station data.`
+              ? `NREL rate limit reached. Try again in about ${cooldownMins} min.`
               : isInvalidParams
-                ? `NREL could not process ZIP ${activeZip}. Showing sample station data.`
-              : `Live API unavailable (${e?.message || "unknown error"}). Showing sample data.`
+                ? `NREL could not process ZIP ${activeZip}.`
+              : `Live API unavailable (${e?.message || "unknown error"}).`
           );
           setSelected(null);
-          setStations(buildFallbackPins());
-          setLastUpdated(new Date());
+          setStations([]);
+          setLastUpdated(null);
         }
       } finally {
         if (!cancelled) setLoading(false);
@@ -688,6 +698,7 @@ function NrelLiveMap({ height = 480 }) {
 
       {loading && <div style={{position:"absolute",inset:0,display:"flex",alignItems:"center",justifyContent:"center",color:"#fff",fontSize:13,background:"rgba(0,0,0,0.25)"}}>Loading nearby EV chargers for ZIP {activeZip}...</div>}
       {!loading && error && <div style={{position:"absolute",left:14,top:62,right:14,padding:"10px 12px",borderRadius:8,fontSize:12,color:"#fde68a",background:"rgba(245,158,11,0.14)",border:"1px solid rgba(245,158,11,0.35)"}}>NREL API notice: {error}</div>}
+      {!loading && !error && !activeZip && <div style={{position:"absolute",left:14,top:62,right:14,padding:"10px 12px",borderRadius:8,fontSize:12,color:"#d1d5db",background:"rgba(255,255,255,0.08)",border:"1px solid rgba(255,255,255,0.18)"}}>Enter a ZIP code and click Find Nearby to load EV chargers.</div>}
 
       {selected && (
         <div
@@ -704,7 +715,7 @@ function NrelLiveMap({ height = 480 }) {
       )}
 
       <div style={{ position:"absolute", bottom:6, left:10, fontSize:9, color:"rgba(255,255,255,0.25)", letterSpacing:"0.5px" }}>
-        NREL AFDC Nearest Data · ZIP {activeZip} · {stations.length.toLocaleString()} stations{lastUpdated ? ` · ${lastUpdated.toLocaleTimeString()}` : ""}
+        NREL AFDC Nearest Data{activeZip ? ` · ZIP ${activeZip}` : ""} · {stations.length.toLocaleString()} stations{lastUpdated ? ` · ${lastUpdated.toLocaleTimeString()}` : ""}
       </div>
     </div>
   );

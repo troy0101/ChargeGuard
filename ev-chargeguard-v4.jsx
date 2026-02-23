@@ -448,6 +448,8 @@ function NrelLiveMap({ height = 480 }) {
   const [stations, setStations] = useState([]);
   const [selected, setSelected] = useState(null);
   const [hoveredId, setHoveredId] = useState(null);
+  const [zipInput, setZipInput] = useState("78701");
+  const [activeZip, setActiveZip] = useState("78701");
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [lastUpdated, setLastUpdated] = useState(null);
@@ -456,21 +458,21 @@ function NrelLiveMap({ height = 480 }) {
     let cancelled = false;
     const apiKey = import.meta.env.VITE_MAP_VIEWS_API_KEY || import.meta.env.VITE_NREL_API_KEY || "DEMO_KEY";
 
-    async function getLiveStations() {
+    async function getNearestStationsByZip(zipCode) {
       const requestSets = [
-        { api_key: apiKey, fuel_type: "ELEC", limit: "200" },
-        { api_key: apiKey, fuel_type: "ELEC" },
-        { api_key: apiKey, limit: "200" },
+        { api_key: apiKey, fuel_type: "ELEC", location: zipCode, radius: "25", limit: "60", status: "E" },
+        { api_key: apiKey, fuel_type: "ELEC", location: zipCode, radius: "25", limit: "60" },
+        { api_key: apiKey, location: zipCode, radius: "25", limit: "60" },
       ];
 
       let lastErr = null;
       for (const requestParams of requestSets) {
         try {
-          const data = await getAltFuelStations(requestParams, "json");
+          const data = await getNearestAltFuelStations(requestParams, "json");
           return Array.isArray(data?.fuel_stations) ? data.fuel_stations : [];
         } catch (err) {
           lastErr = err;
-          if (err?.status !== 422) throw err;
+          if (err?.status !== 422 && err?.status !== 429) throw err;
         }
       }
 
@@ -481,11 +483,15 @@ function NrelLiveMap({ height = 480 }) {
       setLoading(true);
       setError("");
       try {
-        const rows = await getLiveStations();
+        const rows = await getNearestStationsByZip(activeZip);
         const mapped = rows.map(mapApiStationToPin).filter(Boolean);
 
         if (!cancelled) {
+          setSelected(null);
           setStations(mapped);
+          if (!mapped.length) {
+            setError(`No nearby EV chargers found for ZIP ${activeZip}. Try another ZIP code.`);
+          }
           setLastUpdated(new Date());
         }
       } catch (e) {
@@ -496,9 +502,10 @@ function NrelLiveMap({ height = 480 }) {
             isRateLimit
               ? "NREL rate limit reached. Showing sample station data."
               : isInvalidParams
-                ? "NREL rejected live query parameters. Showing sample station data."
+                ? `NREL could not process ZIP ${activeZip}. Showing sample station data.`
               : `Live API unavailable (${e?.message || "unknown error"}). Showing sample data.`
           );
+          setSelected(null);
           setStations(buildFallbackPins());
           setLastUpdated(new Date());
         }
@@ -509,13 +516,78 @@ function NrelLiveMap({ height = 480 }) {
 
     loadStations();
     return () => { cancelled = true; };
-  }, []);
+  }, [activeZip]);
+
+  function handleZipSubmit(event) {
+    event?.preventDefault?.();
+    const normalized = zipInput.trim();
+    if (!/^\d{5}(?:-\d{4})?$/.test(normalized)) {
+      setError("Enter a valid U.S. ZIP code (e.g. 78701).");
+      return;
+    }
+    if (normalized === activeZip) return;
+    setActiveZip(normalized);
+  }
 
   return (
     <div
       style={{ position:"relative", height, background:"#1a2535", overflow:"hidden", fontFamily:"var(--font)" }}
       onClick={() => setSelected(null)}
     >
+      <form
+        onSubmit={handleZipSubmit}
+        style={{
+          position:"absolute",
+          left:14,
+          top:14,
+          zIndex:25,
+          display:"flex",
+          alignItems:"center",
+          gap:8,
+          padding:"8px",
+          borderRadius:8,
+          border:"1px solid rgba(255,255,255,0.18)",
+          background:"rgba(0,0,0,0.35)"
+        }}
+      >
+        <input
+          value={zipInput}
+          onChange={(e) => setZipInput(e.target.value.replace(/[^\d-]/g, ""))}
+          placeholder="ZIP (e.g. 78701)"
+          maxLength={10}
+          style={{
+            width:128,
+            height:34,
+            borderRadius:6,
+            border:"1px solid rgba(255,255,255,0.28)",
+            background:"rgba(255,255,255,0.12)",
+            color:"#fff",
+            fontSize:12,
+            padding:"0 10px",
+            outline:"none",
+            fontFamily:"var(--font)"
+          }}
+        />
+        <button
+          type="submit"
+          style={{
+            height:34,
+            borderRadius:6,
+            border:"none",
+            background:"#f26419",
+            color:"#fff",
+            fontSize:12,
+            fontWeight:700,
+            letterSpacing:"0.3px",
+            padding:"0 12px",
+            cursor:"pointer",
+            fontFamily:"var(--font)"
+          }}
+        >
+          Find Nearby
+        </button>
+      </form>
+
       <svg viewBox="0 0 720 460" style={{ width:"100%", height:"100%", display:"block" }} preserveAspectRatio="xMidYMid slice">
         <defs>
           <pattern id="nrelgrid" width="60" height="60" patternUnits="userSpaceOnUse">
@@ -552,8 +624,8 @@ function NrelLiveMap({ height = 480 }) {
         })}
       </svg>
 
-      {loading && <div style={{position:"absolute",inset:0,display:"flex",alignItems:"center",justifyContent:"center",color:"#fff",fontSize:13,background:"rgba(0,0,0,0.25)"}}>Loading NREL EV stations...</div>}
-      {!loading && error && <div style={{position:"absolute",left:14,top:14,right:14,padding:"10px 12px",borderRadius:8,fontSize:12,color:"#fde68a",background:"rgba(245,158,11,0.14)",border:"1px solid rgba(245,158,11,0.35)"}}>NREL API notice: {error}</div>}
+      {loading && <div style={{position:"absolute",inset:0,display:"flex",alignItems:"center",justifyContent:"center",color:"#fff",fontSize:13,background:"rgba(0,0,0,0.25)"}}>Loading nearby EV chargers for ZIP {activeZip}...</div>}
+      {!loading && error && <div style={{position:"absolute",left:14,top:62,right:14,padding:"10px 12px",borderRadius:8,fontSize:12,color:"#fde68a",background:"rgba(245,158,11,0.14)",border:"1px solid rgba(245,158,11,0.35)"}}>NREL API notice: {error}</div>}
 
       {selected && (
         <div
@@ -570,7 +642,7 @@ function NrelLiveMap({ height = 480 }) {
       )}
 
       <div style={{ position:"absolute", bottom:6, left:10, fontSize:9, color:"rgba(255,255,255,0.25)", letterSpacing:"0.5px" }}>
-        NREL AFDC Live Data · {stations.length.toLocaleString()} stations{lastUpdated ? ` · ${lastUpdated.toLocaleTimeString()}` : ""}
+        NREL AFDC Nearest Data · ZIP {activeZip} · {stations.length.toLocaleString()} stations{lastUpdated ? ` · ${lastUpdated.toLocaleTimeString()}` : ""}
       </div>
     </div>
   );
@@ -1006,8 +1078,8 @@ function HomePage({ setModal, locations, aboutText }) {
       <div id="mapSection">
         <div style={{padding:"48px 48px 24px",background:"var(--white)"}}>
           <div className="section-tag">Live Network Map</div>
-          <h2 className="section-title">Active U.S. EV Stations</h2>
-          <p style={{color:"var(--mid-grey)",fontSize:14,marginBottom:0}}>Live station data from the NREL Alternative Fuel Stations API. Click any pin to view details.</p>
+          <h2 className="section-title">Find Chargers by ZIP Code</h2>
+          <p style={{color:"var(--mid-grey)",fontSize:14,marginBottom:0}}>Enter a U.S. ZIP code to load nearby EV chargers from the NREL Alternative Fuel Stations API.</p>
         </div>
         <NrelLiveMap height={480} />
         <div className="map-legend-bar">

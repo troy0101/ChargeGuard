@@ -357,6 +357,10 @@ const STATE_LABELS = [
 const NREL_API_BASE_URL = (import.meta.env.VITE_NREL_API_BASE_URL || "https://developer.nrel.gov").replace(/\/$/, "");
 const ALT_FUEL_STATIONS_PATH = "/api/alt-fuel-stations/v1";
 const ALT_FUEL_STATIONS_NEAREST_PATH = "/api/alt-fuel-stations/v1/nearest";
+const NREL_CACHE_TTL_MS = 15 * 60 * 1000;
+const NREL_RATE_LIMIT_COOLDOWN_MS = 10 * 60 * 1000;
+const NREL_CACHE_KEY_PREFIX = "nrel-nearest-cache:";
+const NREL_RATE_LIMIT_KEY = "nrel-rate-limit-until";
 
 function buildAltFuelStationsUrl(path, params, format = "json") {
   const query = new URLSearchParams(params);
@@ -377,6 +381,43 @@ function getApiErrorMessage(payload, status) {
   if (status === 429) return "Rate limit reached";
   if (status === 422) return "Invalid request parameters";
   return payload?.error?.message || payload?.errors?.[0] || payload?.message || "Request failed";
+}
+
+function safeReadJsonFromStorage(key) {
+  try {
+    const raw = window.localStorage.getItem(key);
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+}
+
+function readNearestCache(zipCode) {
+  const cached = safeReadJsonFromStorage(`${NREL_CACHE_KEY_PREFIX}${zipCode}`);
+  if (!cached || !Array.isArray(cached.rows) || !cached.ts) return null;
+  if (Date.now() - Number(cached.ts) > NREL_CACHE_TTL_MS) return null;
+  return cached.rows;
+}
+
+function writeNearestCache(zipCode, rows) {
+  try {
+    window.localStorage.setItem(`${NREL_CACHE_KEY_PREFIX}${zipCode}`, JSON.stringify({ ts: Date.now(), rows }));
+  } catch {
+  }
+}
+
+function getRateLimitCooldownRemainingMs() {
+  const untilRaw = window.localStorage.getItem(NREL_RATE_LIMIT_KEY);
+  const until = Number(untilRaw || 0);
+  if (!until || Number.isNaN(until)) return 0;
+  return Math.max(0, until - Date.now());
+}
+
+function setRateLimitCooldown() {
+  try {
+    window.localStorage.setItem(NREL_RATE_LIMIT_KEY, String(Date.now() + NREL_RATE_LIMIT_COOLDOWN_MS));
+  } catch {
+  }
 }
 
 async function getAltFuelStations(params, format = "json") {
@@ -459,20 +500,38 @@ function NrelLiveMap({ height = 480 }) {
     const apiKey = import.meta.env.VITE_MAP_VIEWS_API_KEY || import.meta.env.VITE_NREL_API_KEY || "DEMO_KEY";
 
     async function getNearestStationsByZip(zipCode) {
+      const cachedRows = readNearestCache(zipCode);
+      if (cachedRows) {
+        return { rows: cachedRows, fromCache: true };
+      }
+
+      const cooldownMs = getRateLimitCooldownRemainingMs();
+      if (cooldownMs > 0) {
+        const err = new Error("Rate limit cooldown active");
+        err.status = 429;
+        err.cooldownMs = cooldownMs;
+        throw err;
+      }
+
       const requestSets = [
-        { api_key: apiKey, fuel_type: "ELEC", location: zipCode, radius: "25", limit: "60", status: "E" },
-        { api_key: apiKey, fuel_type: "ELEC", location: zipCode, radius: "25", limit: "60" },
-        { api_key: apiKey, location: zipCode, radius: "25", limit: "60" },
+        { api_key: apiKey, fuel_type: "ELEC", location: zipCode, radius: "25", limit: "40" },
+        { api_key: apiKey, location: zipCode, radius: "25", limit: "40" },
       ];
 
       let lastErr = null;
       for (const requestParams of requestSets) {
         try {
           const data = await getNearestAltFuelStations(requestParams, "json");
-          return Array.isArray(data?.fuel_stations) ? data.fuel_stations : [];
+          const rows = Array.isArray(data?.fuel_stations) ? data.fuel_stations : [];
+          writeNearestCache(zipCode, rows);
+          return { rows, fromCache: false };
         } catch (err) {
           lastErr = err;
-          if (err?.status !== 422 && err?.status !== 429) throw err;
+          if (err?.status === 429) {
+            setRateLimitCooldown();
+            throw err;
+          }
+          if (err?.status !== 422) throw err;
         }
       }
 
@@ -483,13 +542,15 @@ function NrelLiveMap({ height = 480 }) {
       setLoading(true);
       setError("");
       try {
-        const rows = await getNearestStationsByZip(activeZip);
+        const { rows, fromCache } = await getNearestStationsByZip(activeZip);
         const mapped = rows.map(mapApiStationToPin).filter(Boolean);
 
         if (!cancelled) {
           setSelected(null);
           setStations(mapped);
-          if (!mapped.length) {
+          if (fromCache) {
+            setError(`Showing cached nearby chargers for ZIP ${activeZip}.`);
+          } else if (!mapped.length) {
             setError(`No nearby EV chargers found for ZIP ${activeZip}. Try another ZIP code.`);
           }
           setLastUpdated(new Date());
@@ -498,9 +559,10 @@ function NrelLiveMap({ height = 480 }) {
         if (!cancelled) {
           const isRateLimit = e?.status === 429 || String(e?.message || "").toLowerCase().includes("rate limit");
           const isInvalidParams = e?.status === 422 || String(e?.message || "").toLowerCase().includes("invalid request");
+          const cooldownMins = Math.max(1, Math.ceil(Number(e?.cooldownMs || 0) / 60000));
           setError(
             isRateLimit
-              ? "NREL rate limit reached. Showing sample station data."
+              ? `NREL rate limit reached. Try again in about ${cooldownMins} min. Showing sample station data.`
               : isInvalidParams
                 ? `NREL could not process ZIP ${activeZip}. Showing sample station data.`
               : `Live API unavailable (${e?.message || "unknown error"}). Showing sample data.`

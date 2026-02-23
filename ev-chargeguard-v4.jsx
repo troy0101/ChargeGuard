@@ -594,6 +594,7 @@ function NrelLiveMap({ height = 480 }) {
   const [chargerSearch, setChargerSearch] = useState("");
   const [zipInput, setZipInput] = useState("");
   const [activeZip, setActiveZip] = useState("");
+  const [searchRevision, setSearchRevision] = useState(0);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [mapError, setMapError] = useState("");
@@ -748,7 +749,7 @@ function NrelLiveMap({ height = 480 }) {
 
     loadStations();
     return () => { cancelled = true; };
-  }, [activeZip]);
+  }, [activeZip, searchRevision]);
 
   useEffect(() => {
     if (!mapsReady || !mapRef.current || !window.google?.maps) return;
@@ -812,7 +813,12 @@ function NrelLiveMap({ height = 480 }) {
       return;
     }
     const zip5 = normalizeZip(normalized);
-    if (zip5 === activeZip) return;
+    setError("");
+    if (zip5 === activeZip) {
+      clearRateLimitCooldown();
+      setSearchRevision((value) => value + 1);
+      return;
+    }
     setActiveZip(zip5);
   }
 
@@ -846,9 +852,9 @@ function NrelLiveMap({ height = 480 }) {
             width:128,
             height:34,
             borderRadius:6,
-            border:"1px solid rgba(255,255,255,0.28)",
-            background:"rgba(255,255,255,0.12)",
-            color:"#fff",
+            border:"1px solid rgba(255,255,255,0.40)",
+            background:"rgba(255,255,255,0.96)",
+            color:"#111",
             fontSize:12,
             padding:"0 10px",
             outline:"none",
@@ -906,9 +912,9 @@ function NrelLiveMap({ height = 480 }) {
       )}
 
       {loading && <div style={{position:"absolute",inset:0,display:"flex",alignItems:"center",justifyContent:"center",color:"#fff",fontSize:13,background:"rgba(0,0,0,0.25)"}}>Loading nearby EV chargers for ZIP {activeZip}...</div>}
-      {!loading && error && <div style={{position:"absolute",left:14,top:62,right:14,padding:"10px 12px",borderRadius:8,fontSize:12,color:"#fde68a",background:"rgba(245,158,11,0.14)",border:"1px solid rgba(245,158,11,0.35)"}}>NREL API notice: {error}</div>}
+      {!loading && error && <div style={{position:"absolute",left:14,top:mapError ? 106 : 62,right:14,padding:"10px 12px",borderRadius:8,fontSize:12,color:"#fde68a",background:"rgba(245,158,11,0.14)",border:"1px solid rgba(245,158,11,0.35)"}}>NREL API notice: {error}</div>}
       {!loading && mapError && <div style={{position:"absolute",left:14,top:62,right:14,padding:"10px 12px",borderRadius:8,fontSize:12,color:"#fecaca",background:"rgba(239,68,68,0.14)",border:"1px solid rgba(239,68,68,0.35)"}}>Google Maps error: {mapError} Showing embedded fallback map.</div>}
-      {!loading && !error && !activeZip && <div style={{position:"absolute",left:14,top:62,right:14,padding:"10px 12px",borderRadius:8,fontSize:12,color:"#d1d5db",background:"rgba(255,255,255,0.08)",border:"1px solid rgba(255,255,255,0.18)"}}>Enter a ZIP code and click Find Nearby to load EV chargers.</div>}
+      {!loading && !error && !activeZip && !mapError && <div style={{position:"absolute",left:14,top:62,right:14,padding:"10px 12px",borderRadius:8,fontSize:12,color:"#d1d5db",background:"rgba(255,255,255,0.08)",border:"1px solid rgba(255,255,255,0.18)"}}>Enter a ZIP code and click Find Nearby to load EV chargers.</div>}
 
       {activeZip && stations.length > 0 && (
         <div style={{position:"absolute",right:14,top:62,width:300,maxHeight:270,overflowY:"auto",borderRadius:10,padding:10,background:"rgba(0,0,0,0.38)",border:"1px solid rgba(255,255,255,0.14)",zIndex:22}}>
